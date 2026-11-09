@@ -1,0 +1,4 @@
+LLMConnectionError
+SpeechRecognitionError
+TTSError
+ConfigurationError

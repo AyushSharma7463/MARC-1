@@ -1,0 +1,24 @@
+================ SPRINT 4 BACKUP ================
+
+================ backend/run_voice.py ==================
+❌ FILE NOT FOUND
+
+================ backend/pipeline/voice_pipeline.py ==================
+❌ FILE NOT FOUND
+
+================ backend/pipeline/assistant.py ==================
+❌ FILE NOT FOUND
+
+================ backend/stt/whisper.py ==================
+❌ FILE NOT FOUND
+
+================ backend/audio/stream_recorder.py ==================
+❌ FILE NOT FOUND
+
+================ backend/state/conversation.py ==================
+❌ FILE NOT FOUND
+
+================ backend/tts/piper_tts.py ==================
+❌ FILE NOT FOUND
+
+================ BACKUP COMPLETE ================

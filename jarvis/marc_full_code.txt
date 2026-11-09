@@ -1,0 +1,2558 @@
+================ ./backend/__init__.py ==================
+
+================ ./backend/audio/__init__.py ==================
+
+================ ./backend/audio/audio_state.py ==================
+     1	class AudioState:
+     2	    """
+     3	    Shared audio state for full duplex control
+     4	    """
+     5	
+     6	    def __init__(self):
+     7	        self.is_speaking = False
+     8	        self.is_listening = True
+     9	        self.should_interrupt_tts = False
+    10	
+    11	    def start_speaking(self):
+    12	        self.is_speaking = True
+    13	        self.is_listening = False
+    14	
+    15	    def stop_speaking(self):
+    16	        self.is_speaking = False
+    17	        self.is_listening = True
+    18	
+    19	    def interrupt(self):
+    20	        self.should_interrupt_tts = True
+    21	
+    22	    def reset_interrupt(self):
+    23	        self.should_interrupt_tts = False
+================ ./backend/audio/microphone.py ==================
+     1	import sounddevice as sd
+     2	import numpy as np
+     3	
+     4	from backend.core.logger import get_logger
+     5	
+     6	class Microphone:
+     7	    """
+     8	    Handles microphone input for Jarvis.
+     9	    """
+    10	
+    11	    def __init__(
+    12	        self,
+    13	        sample_rate: int = 16000,
+    14	        channels: int = 1,
+    15	        device: int | None = None,
+    16	    ):
+    17	        self.sample_rate = sample_rate
+    18	        self.channels = channels
+    19	        self.device = device
+    20	
+    21	        self.logger = get_logger("Microphone")
+    22	
+    23	    def list_devices(self):
+    24	        """
+    25	        Print all available audio devices.
+    26	        """
+    27	        devices = sd.query_devices()
+    28	
+    29	        for index, device in enumerate(devices):
+    30	            print(f"{index}: {device['name']}")
+    31	
+    32	        return devices
+    33	
+    34	    def record(self, duration: float) -> np.ndarray:
+    35	        """
+    36	        Record audio from the microphone.
+    37	
+    38	        Returns
+    39	        -------
+    40	        numpy.ndarray
+    41	            Recorded audio samples.
+    42	        """
+    43	
+    44	        self.logger.info(f"Recording started ({duration}s)")
+    45	
+    46	        audio = sd.rec(
+    47	            int(duration * self.sample_rate),
+    48	            samplerate=self.sample_rate,
+    49	            channels=self.channels,
+    50	            dtype="float32",
+    51	            device=self.device,
+    52	        )
+    53	
+    54	        sd.wait()
+    55	
+    56	        self.logger.info("Recording finished")
+    57	
+    58	        return audio
+================ ./backend/audio/playback_manager.py ==================
+     1	from threading import Lock, Thread
+     2	
+     3	from backend.core.logger import get_logger
+     4	from backend.tts.piper import PiperTTS
+     5	
+     6	
+     7	class PlaybackManager:
+     8	    """
+     9	    Controls all audio playback for MARC.
+    10	    """
+    11	
+    12	    def __init__(self, model_path: str):
+    13	
+    14	        self.logger = get_logger("PlaybackManager")
+    15	
+    16	        self.tts = PiperTTS(
+    17	            model_path=model_path,
+    18	        )
+    19	
+    20	        self._lock = Lock()
+    21	        self._thread = None
+    22	
+    23	    def speak(self, text: str):
+    24	        """
+    25	        Blocking playback.
+    26	        """
+    27	
+    28	        if not text:
+    29	            return
+    30	
+    31	        with self._lock:
+    32	
+    33	            self.logger.info("Playback started")
+    34	
+    35	            try:
+    36	                self.tts.speak(text)
+    37	
+    38	            finally:
+    39	                self.logger.info("Playback finished")
+    40	
+    41	    def speak_async(self, text: str):
+    42	        """
+    43	        Start playback in a background thread.
+    44	        Returns immediately.
+    45	        """
+    46	
+    47	        # Don't overlap speech
+    48	        if self.is_playing():
+    49	            self.stop()
+    50	
+    51	        self._thread = Thread(
+    52	            target=self.speak,
+    53	            args=(text,),
+    54	            daemon=True,
+    55	        )
+    56	
+    57	        self._thread.start()
+    58	
+    59	    def stop(self):
+    60	        """
+    61	        Stop current playback immediately.
+    62	        """
+    63	
+    64	        with self._lock:
+    65	
+    66	            if self.tts.is_playing():
+    67	
+    68	                self.logger.info("Playback interrupted")
+    69	
+    70	                self.tts.stop()
+    71	
+    72	    def wait(self):
+    73	        """
+    74	        Wait until playback finishes.
+    75	        """
+    76	
+    77	        if self._thread is not None:
+    78	            self._thread.join()
+    79	            self._thread = None
+    80	
+    81	    def is_playing(self) -> bool:
+    82	        """
+    83	        Returns True while audio is playing.
+    84	        """
+    85	
+    86	        return self.tts.is_playing()
+    87	    def speak(self, text, audio_state=None):
+    88	     """
+    89	     Full duplex-safe TTS
+    90	     """
+    91	
+    92	     audio_state.start_speaking()
+    93	
+    94	     try:
+    95	        self._engine.say(text)
+    96	        self._engine.runAndWait()
+    97	
+    98	     except Exception:
+    99	        pass
+   100	
+   101	     finally:
+   102	        audio_state.stop_speaking()
+================ ./backend/audio/recorder.py ==================
+     1	from pathlib import Path
+     2	
+     3	import soundfile as sf
+     4	
+     5	from backend.audio.microphone import Microphone
+     6	from backend.core.logger import get_logger
+     7	
+     8	class Recorder:
+     9	    """
+    10	    Records audio from the microphone and saves it as a WAV file.
+    11	    """
+    12	
+    13	    def __init__(
+    14	        self,
+    15	        sample_rate: int = 16000,
+    16	        channels: int = 1,
+    17	    ):
+    18	        self.microphone = Microphone(
+    19	            sample_rate=sample_rate,
+    20	            channels=channels,
+    21	        )
+    22	
+    23	        self.sample_rate = sample_rate
+    24	
+    25	        self.logger = get_logger("Recorder")
+    26	
+    27	        # Always save inside the project's recordings folder
+    28	        self.output_dir = (
+    29	            Path(__file__).resolve().parent.parent.parent / "recordings"
+    30	        )
+    31	        self.output_dir.mkdir(exist_ok=True)
+    32	
+    33	    def record(
+    34	        self,
+    35	        duration: float = 5,
+    36	        filename: str = "output.wav",
+    37	    ) -> Path:
+    38	        """
+    39	        Record audio and save it as a WAV file.
+    40	
+    41	        Returns
+    42	        -------
+    43	        Path
+    44	            Path to the saved recording.
+    45	        """
+    46	
+    47	        self.logger.info("Starting recorder")
+    48	
+    49	        audio = self.microphone.record(duration)
+    50	
+    51	        output_path = self.output_dir / filename
+    52	
+    53	        sf.write(
+    54	            output_path,
+    55	            audio,
+    56	            self.sample_rate,
+    57	        )
+    58	
+    59	        self.logger.info(f"Audio saved to {output_path}")
+    60	
+    61	        return output_path
+    62	
+    63	
+    64	if __name__ == "__main__":
+    65	    recorder = Recorder()
+    66	
+    67	    print("Recording for 5 seconds...")
+    68	
+    69	    file_path = recorder.record()
+    70	
+    71	    print(f"\nRecording saved to:\n{file_path}")
+================ ./backend/audio/stream_recorder.py ==================
+     1	from pathlib import Path
+     2	from datetime import datetime
+     3	
+     4	import numpy as np
+     5	import sounddevice as sd
+     6	import soundfile as sf
+     7	
+     8	from backend.audio.vad import VoiceActivityDetector
+     9	from backend.core.logger import get_logger
+    10	
+    11	
+    12	class StreamRecorder:
+    13	    """
+    14	    Continuously listens to the microphone.
+    15	
+    16	    Starts recording when speech is detected.
+    17	
+    18	    Stops recording after prolonged silence.
+    19	
+    20	    Also provides lightweight speech detection
+    21	    for future barge-in support.
+    22	    """
+    23	
+    24	    def __init__(
+    25	        self,
+    26	        sample_rate: int = 16000,
+    27	        channels: int = 1,
+    28	        chunk_ms: int = 30,
+    29	    ):
+    30	
+    31	        self.sample_rate = sample_rate
+    32	        self.channels = channels
+    33	        self.chunk_ms = chunk_ms
+    34	
+    35	        self.chunk_size = int(
+    36	            sample_rate * chunk_ms / 1000
+    37	        )
+    38	
+    39	        self.logger = get_logger("StreamRecorder")
+    40	
+    41	        self.vad = VoiceActivityDetector()
+    42	
+    43	        self.stream = None
+    44	
+    45	        self.output_dir = (
+    46	            Path(__file__).resolve().parent.parent.parent
+    47	            / "recordings"
+    48	        )
+    49	
+    50	        self.output_dir.mkdir(exist_ok=True)
+    51	
+    52	    # --------------------------------------------------
+    53	    # Stream Management
+    54	    # --------------------------------------------------
+    55	
+    56	    def start_stream(self):
+    57	        """
+    58	        Open the microphone if not already open.
+    59	        """
+    60	
+    61	        if self.stream is None:
+    62	
+    63	            self.stream = sd.InputStream(
+    64	                samplerate=self.sample_rate,
+    65	                channels=self.channels,
+    66	                dtype="float32",
+    67	                blocksize=self.chunk_size,
+    68	            )
+    69	
+    70	            self.stream.start()
+    71	
+    72	            self.logger.info("Microphone opened")
+    73	
+    74	    def stop_stream(self):
+    75	        """
+    76	        Close microphone.
+    77	        """
+    78	
+    79	        if self.stream is not None:
+    80	
+    81	            self.stream.stop()
+    82	            self.stream.close()
+    83	
+    84	            self.stream = None
+    85	
+    86	            self.logger.info("Microphone closed")
+    87	
+    88	    # --------------------------------------------------
+    89	    # Recording
+    90	    # --------------------------------------------------
+    91	
+    92	    def generate_filename(self) -> Path:
+    93	
+    94	        timestamp = datetime.now().strftime(
+    95	            "%Y%m%d_%H%M%S"
+    96	        )
+    97	
+    98	        return self.output_dir / f"{timestamp}.wav"
+    99	
+   100	    def record(self) -> Path | None:
+   101	
+   102	        self.logger.info("Listening...")
+   103	
+   104	        self.start_stream()
+   105	
+   106	        buffer = []
+   107	
+   108	        try:
+   109	
+   110	            while True:
+   111	
+   112	                chunk, _ = self.stream.read(
+   113	                    self.chunk_size
+   114	                )
+   115	
+   116	                chunk = chunk.flatten()
+   117	
+   118	                state = self.vad.update(chunk)
+   119	
+   120	                if state == "idle":
+   121	                    continue
+   122	
+   123	                if state == "start":
+   124	
+   125	                    self.logger.info(
+   126	                        "Recording started"
+   127	                    )
+   128	
+   129	                    buffer = [chunk]
+   130	
+   131	                    continue
+   132	
+   133	                if state == "recording":
+   134	
+   135	                    buffer.append(chunk)
+   136	
+   137	                    continue
+   138	
+   139	                if state == "stop":
+   140	
+   141	                    self.logger.info(
+   142	                        "Recording stopped"
+   143	                    )
+   144	
+   145	                    audio = np.concatenate(buffer)
+   146	
+   147	                    filename = self.generate_filename()
+   148	
+   149	                    sf.write(
+   150	                        filename,
+   151	                        audio,
+   152	                        self.sample_rate,
+   153	                    )
+   154	
+   155	                    self.logger.info(
+   156	                        f"Saved {filename.name}"
+   157	                    )
+   158	
+   159	                    return filename
+   160	
+   161	        finally:
+   162	
+   163	            self.stop_stream()
+   164	
+   165	    # --------------------------------------------------
+   166	    # Speech Detection
+   167	    # --------------------------------------------------
+   168	
+   169	    def detect_speech(self) -> bool:
+   170	        """
+   171	        Returns True if speech is detected.
+   172	
+   173	        Used for future interruptible TTS.
+   174	        """
+   175	
+   176	        self.start_stream()
+   177	
+   178	        chunk, _ = self.stream.read(
+   179	            self.chunk_size
+   180	        )
+   181	
+   182	        chunk = chunk.flatten()
+   183	
+   184	        return self.vad.is_speech(chunk)
+   185	    def listen_stream(self, callback):
+   186	     """
+   187	     Continuous streaming mode (NO stop-start)
+   188	     """
+   189	
+   190	     self.start_stream()
+   191	
+   192	     buffer = []
+   193	
+   194	     while True:
+   195	
+   196	        chunk, _ = self.stream.read(self.chunk_size)
+   197	        chunk = chunk.flatten()
+   198	
+   199	        state = self.vad.update(chunk)
+   200	
+   201	        if state == "start":
+   202	            buffer = [chunk]
+   203	
+   204	        elif state == "recording":
+   205	            buffer.append(chunk)
+   206	
+   207	        elif state == "stop":
+   208	
+   209	            audio = np.concatenate(buffer)
+   210	
+   211	            filename = self.generate_filename()
+   212	
+   213	            sf.write(filename, audio, self.sample_rate)
+   214	
+   215	            callback(filename)
+   216	    
+   217	
+   218	
+   219	if __name__ == "__main__":
+   220	
+   221	    recorder = StreamRecorder()
+   222	
+   223	    print()
+   224	    print("Speak...")
+   225	
+   226	    file = recorder.record()
+   227	
+   228	    print()
+   229	    print(file)
+================ ./backend/audio/vad.py ==================
+     1	import numpy as np
+     2	
+     3	try:
+     4	    from backend.core.logger import get_logger
+     5	except ModuleNotFoundError:
+     6	    # Allow running this file directly
+     7	    import sys
+     8	    from pathlib import Path
+     9	
+    10	    project_root = Path(__file__).resolve().parents[2]
+    11	    sys.path.append(str(project_root))
+    12	
+    13	    from backend.core.logger import get_logger
+    14	
+    15	
+    16	class VoiceActivityDetector:
+    17	    """
+    18	    Energy-based Voice Activity Detection (VAD).
+    19	
+    20	    States:
+    21	        - Idle
+    22	        - Speech Detected
+    23	        - Recording
+    24	        - Stop Recording
+    25	    """
+    26	
+    27	    def __init__(
+    28	        self,
+    29	        threshold: float = 0.015,
+    30	        speech_frames: int = 3,
+    31	        silence_frames: int = 50,
+    32	    ):
+    33	        """
+    34	        Parameters
+    35	        ----------
+    36	        threshold
+    37	            Minimum RMS energy considered speech.
+    38	
+    39	        speech_frames
+    40	            Number of consecutive speech chunks required
+    41	            before recording starts.
+    42	
+    43	        silence_frames
+    44	            Number of consecutive silence chunks required
+    45	            before recording stops.
+    46	        """
+    47	
+    48	        self.threshold = threshold
+    49	
+    50	        self.required_speech_frames = speech_frames
+    51	        self.required_silence_frames = silence_frames
+    52	
+    53	        self.speech_count = 0
+    54	        self.silence_count = 0
+    55	
+    56	        self.recording = False
+    57	
+    58	        self.logger = get_logger("VAD")
+    59	
+    60	    def rms(self, audio_chunk: np.ndarray) -> float:
+    61	        """
+    62	        Compute RMS energy.
+    63	        """
+    64	
+    65	        if len(audio_chunk) == 0:
+    66	            return 0.0
+    67	
+    68	        return np.sqrt(np.mean(audio_chunk ** 2))
+    69	
+    70	    def is_speech(self, audio_chunk: np.ndarray) -> bool:
+    71	        """
+    72	        Returns True if the audio chunk contains speech.
+    73	        """
+    74	
+    75	        energy = self.rms(audio_chunk)
+    76	
+    77	        self.logger.info(f"Energy: {energy:.5f}")
+    78	
+    79	        return energy >= self.threshold
+    80	
+    81	    def update(self, audio_chunk: np.ndarray):
+    82	        """
+    83	        Process one audio chunk.
+    84	
+    85	        Returns
+    86	        -------
+    87	        idle
+    88	            Waiting for speech.
+    89	
+    90	        start
+    91	            Start recording.
+    92	
+    93	        recording
+    94	            Continue recording.
+    95	
+    96	        stop
+    97	            Stop recording.
+    98	        """
+    99	
+   100	        is_speech = self.is_speech(audio_chunk)
+   101	
+   102	        # -----------------------------
+   103	        # Waiting for speech
+   104	        # -----------------------------
+   105	        if not self.recording:
+   106	
+   107	            if is_speech:
+   108	
+   109	                self.speech_count += 1
+   110	
+   111	                if self.speech_count >= self.required_speech_frames:
+   112	
+   113	                    self.recording = True
+   114	                    self.silence_count = 0
+   115	
+   116	                    self.logger.info("Speech detected")
+   117	
+   118	                    return "start"
+   119	
+   120	            else:
+   121	
+   122	                self.speech_count = 0
+   123	
+   124	            return "idle"
+   125	
+   126	        # -----------------------------
+   127	        # Already recording
+   128	        # -----------------------------
+   129	        if is_speech:
+   130	
+   131	            self.silence_count = 0
+   132	
+   133	            return "recording"
+   134	
+   135	        self.silence_count += 1
+   136	
+   137	        if self.silence_count >= self.required_silence_frames:
+   138	
+   139	            self.recording = False
+   140	
+   141	            self.speech_count = 0
+   142	            self.silence_count = 0
+   143	
+   144	            self.logger.info("Silence detected")
+   145	
+   146	            return "stop"
+   147	
+   148	        return "recording"
+================ ./backend/brain/__init__.py ==================
+
+================ ./backend/brain/events.py ==================
+
+================ ./backend/brain/executor.py ==================
+     1	from backend.brain.plan import Plan, StepStatus
+     2	from backend.core.logger import get_logger
+     3	from backend.llm.factory import create_llm
+     4	from backend.tools.calculator import calculate
+     5	
+     6	
+     7	class Executor:
+     8	    """
+     9	    Executes a Plan generated by the Planner.
+    10	
+    11	    The Executor never creates plans.
+    12	    It only executes them.
+    13	    """
+    14	
+    15	    def __init__(self):
+    16	        self.logger = get_logger("Executor")
+    17	        self.llm = create_llm()
+    18	
+    19	    def execute(self, plan: Plan) -> str:
+    20	        """
+    21	        Execute every step in the plan.
+    22	        """
+    23	
+    24	        final_result = ""
+    25	
+    26	        while True:
+    27	
+    28	            step = plan.next_step()
+    29	
+    30	            if step is None:
+    31	                break
+    32	
+    33	            step.status = StepStatus.RUNNING
+    34	
+    35	            try:
+    36	
+    37	                # -----------------------------------------
+    38	                # Calculator
+    39	                # -----------------------------------------
+    40	
+    41	                if step.target == "calculator":
+    42	
+    43	                    expression = step.parameters["expression"]
+    44	
+    45	                    result = calculate(expression)
+    46	
+    47	                # -----------------------------------------
+    48	                # LLM
+    49	                # -----------------------------------------
+    50	
+    51	                elif step.target == "llm":
+    52	
+    53	                    prompt = step.parameters["prompt"]
+    54	
+    55	                    result = self.llm.generate(prompt)
+    56	
+    57	                else:
+    58	
+    59	                    raise ValueError(
+    60	                        f"Unknown target: {step.target}"
+    61	                    )
+    62	
+    63	                step.result = result
+    64	                step.status = StepStatus.COMPLETED
+    65	
+    66	                final_result = result
+    67	
+    68	            except Exception as e:
+    69	
+    70	                step.result = str(e)
+    71	                step.status = StepStatus.FAILED
+    72	
+    73	                self.logger.exception(e)
+    74	
+    75	                final_result = (
+    76	                    "Sorry, execution failed."
+    77	                )
+    78	
+    79	                break
+    80	
+    81	        plan.completed = plan.is_finished()
+    82	
+    83	        return final_result
+================ ./backend/brain/orchestrator.py ==================
+
+================ ./backend/brain/plan.py ==================
+     1	from dataclasses import dataclass, field
+     2	
+     3	
+     4	@dataclass
+     5	class Step:
+     6	    skill: str
+     7	    input: str
+     8	
+     9	
+    10	@dataclass
+    11	class Plan:
+    12	    goal: str
+    13	    steps: list[Step] = field(default_factory=list)
+    14	
+    15	    def add_step(self, skill: str, input: str):
+    16	        self.steps.append(
+    17	            Step(skill=skill, input=input)
+    18	        )
+================ ./backend/brain/planner.py ==================
+     1	from backend.brain.plan import Plan
+     2	
+     3	
+     4	class Planner:
+     5	    """
+     6	    Converts user input into an executable Plan.
+     7	
+     8	    The planner NEVER executes anything.
+     9	    It only decides what should happen.
+    10	    """
+    11	
+    12	    def create_plan(self, user_input: str) -> Plan:
+    13	
+    14	        text = user_input.strip()
+    15	
+    16	        lower = text.lower()
+    17	
+    18	        # --------------------------------------------------
+    19	        # Calculator
+    20	        # --------------------------------------------------
+    21	
+    22	        if any(op in text for op in ["+", "-", "*", "/", "%"]):
+    23	
+    24	            plan = Plan(
+    25	                goal="Solve mathematical expression",
+    26	                confidence=0.98,
+    27	            )
+    28	
+    29	            plan.add_step(
+    30	                action="execute",
+    31	                target="calculator",
+    32	                expression=text,
+    33	            )
+    34	
+    35	            return plan
+    36	
+    37	        # --------------------------------------------------
+    38	        # LLM
+    39	        # --------------------------------------------------
+    40	
+    41	        plan = Plan(
+    42	            goal="Generate response",
+    43	            confidence=0.90,
+    44	        )
+    45	
+    46	        plan.add_step(
+    47	            action="generate",
+    48	            target="llm",
+    49	            prompt=text,
+    50	        )
+    51	
+    52	        return plan
+================ ./backend/brain/state.py ==================
+     1	from collections import deque
+     2	from backend.core.logger import get_logger
+     3	
+     4	
+     5	class BrainState:
+     6	    """
+     7	    Short-term working memory for Brain
+     8	
+     9	    This replaces the messy history list in Assistant.
+    10	    """
+    11	
+    12	    def __init__(self, max_size: int = 20):
+    13	        self.logger = get_logger("BrainState")
+    14	
+    15	        self.memory = deque(maxlen=max_size)
+    16	
+    17	    def add(self, role: str, content: str):
+    18	        self.memory.append({
+    19	            "role": role,
+    20	            "content": content
+    21	        })
+    22	
+    23	    def get_recent(self, limit: int = 10):
+    24	        return list(self.memory)[-limit:]
+    25	
+    26	    def clear(self):
+    27	        self.memory.clear()
+    28	
+    29	    def format_for_prompt(self):
+    30	        """
+    31	        Converts memory into LLM-friendly format
+    32	        """
+    33	        return "\n".join(
+    34	            f"{m['role']}: {m['content']}"
+    35	            for m in self.memory
+    36	        )
+================ ./backend/components/brain.py ==================
+     1	from backend.runtime.component import Component
+     2	from backend.runtime.event import Event
+     3	from backend.brain.orchestrator import Orchestrator
+     4	
+     5	
+     6	class Brain(Component):
+     7	    """
+     8	    Event-driven reasoning core.
+     9	    """
+    10	
+    11	    def __init__(self, bus):
+    12	        super().__init__("brain")
+    13	
+    14	        self.bus = bus
+    15	        self.orchestrator = Orchestrator()
+    16	
+    17	    def start(self):
+    18	        self.running = True
+    19	
+    20	        # CRITICAL: subscribe to input events
+    21	        self.bus.subscribe("text.recognized", self.on_text)
+    22	
+    23	    def update(self):
+    24	        # No polling needed in event-driven design
+    25	        pass
+    26	
+    27	    def stop(self):
+    28	        self.running = False
+    29	
+    30	    def on_text(self, event: Event):
+    31	        if not self.running:
+    32	            return
+    33	
+    34	        text = event.data.get("text")
+    35	        if not text:
+    36	            return
+    37	
+    38	        # Step 1: decide
+    39	        result = self.orchestrator.process(text)
+    40	
+    41	        # Step 3: publish response
+    42	        self.bus.publish(
+    43	            Event(
+    44	                type="response.generated",
+    45	                data={"text": result},
+    46	                source=self.name
+    47	            )
+    48	        )
+================ ./backend/components/microphone.py ==================
+     1	from backend.runtime.component import Component
+     2	from backend.runtime.event import Event
+     3	from backend.audio.stream_recorder import StreamRecorder
+     4	
+     5	
+     6	class Microphone(Component):
+     7	    """
+     8	    Event-driven microphone component
+     9	
+    10	    Responsibility:
+    11	    - Capture audio
+    12	    - Emit event(audio.recorded)
+    13	    """
+    14	
+    15	    def __init__(self, bus):
+    16	        super().__init__("microphone")
+    17	
+    18	        self.bus = bus
+    19	        self.recorder = StreamRecorder()
+    20	
+    21	    # ------------------------------------
+    22	    # Lifecycle
+    23	    # ------------------------------------
+    24	
+    25	    def start(self):
+    26	        self.running = True
+    27	
+    28	    def update(self):
+    29	        if not self.running:
+    30	            return
+    31	
+    32	        audio_file = self.recorder.record()
+    33	
+    34	        if audio_file is None:
+    35	            return
+    36	
+    37	        self.bus.publish(
+    38	            Event(
+    39	                type="audio.recorded",
+    40	                data={"file": str(audio_file)},
+    41	                source=self.name
+    42	            )
+    43	        )
+    44	
+    45	    def stop(self):
+    46	        self.running = False
+    47	        self.recorder.stop_stream()
+================ ./backend/components/speaker.py ==================
+     1	from backend.runtime.component import Component
+     2	from backend.runtime.event import Event
+     3	from backend.audio.playback_manager import PlaybackManager
+     4	
+     5	
+     6	class Speaker(Component):
+     7	    """
+     8	    TTS / Output component
+     9	
+    10	    Listens:
+    11	        response.generated
+    12	
+    13	    Action:
+    14	        Speaks the response aloud
+    15	    """
+    16	
+    17	    def __init__(self, bus):
+    18	        super().__init__("speaker")
+    19	
+    20	        self.bus = bus
+    21	
+    22	        self.tts = PlaybackManager(
+    23	            model_path="/Users/ayushsharma/Downloads/en_US-lessac-medium.onnx"
+    24	        )
+    25	
+    26	    def start(self):
+    27	        self.running = True
+    28	
+    29	    def update(self):
+    30	        pass
+    31	
+    32	    def stop(self):
+    33	        self.running = False
+    34	        self.tts.stop_stream() if hasattr(self.tts, "stop_stream") else None
+    35	
+    36	    # ------------------------------------
+    37	    # Event handler
+    38	    # ------------------------------------
+    39	
+    40	    def on_response(self, event: Event):
+    41	        if not self.running:
+    42	            return
+    43	
+    44	        text = event.data.get("text")
+    45	
+    46	        if not text:
+    47	            return
+    48	
+    49	        print(f"\nMARC: {text}\n")
+    50	
+    51	        self.tts.speak(text)
+================ ./backend/components/whisper.py ==================
+     1	from backend.runtime.component import Component
+     2	from backend.runtime.event import Event
+     3	from backend.stt.whisper import WhisperSTT
+     4	
+     5	
+     6	class Whisper(Component):
+     7	    """
+     8	    Speech-to-Text component
+     9	
+    10	    Listens for:
+    11	        audio.recorded
+    12	
+    13	    Emits:
+    14	        text.transcribed
+    15	    """
+    16	
+    17	    def __init__(self, bus):
+    18	        super().__init__("whisper")
+    19	
+    20	        self.bus = bus
+    21	        self.model = WhisperSTT()
+    22	
+    23	    def start(self):
+    24	        self.running = True
+    25	
+    26	    def update(self):
+    27	        # Whisper does NOT poll audio directly
+    28	        pass
+    29	
+    30	    def stop(self):
+    31	        self.running = False
+    32	
+    33	    # ------------------------------------
+    34	    # Event handler
+    35	    # ------------------------------------
+    36	
+    37	    def on_audio(self, event: Event):
+    38	        if not self.running:
+    39	            return
+    40	
+    41	        audio_file = event.data.get("file")
+    42	
+    43	        if not audio_file:
+    44	            return
+    45	
+    46	        text = self.model.transcribe(audio_file)
+    47	
+    48	        if not text:
+    49	            return
+    50	
+    51	        self.bus.publish(
+    52	            Event(
+    53	                type="text.transcribed",
+    54	                data={"text": text},
+    55	                source=self.name
+    56	            )
+    57	        )
+================ ./backend/core/__init__.py ==================
+
+================ ./backend/core/constants.py ==================
+     1	DEFAULT_MODEL = "llama3.2"
+     2	
+     3	DEFAULT_TIMEOUT = 120
+================ ./backend/core/exceptions.py ==================
+     1	LLMConnectionError
+     2	SpeechRecognitionError
+     3	TTSError
+     4	ConfigurationError
+================ ./backend/core/logger.py ==================
+     1	import logging
+     2	from pathlib import Path
+     3	
+     4	from backend.core.settings import settings
+     5	
+     6	
+     7	# Ensure the logs directory exists
+     8	LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
+     9	LOG_DIR.mkdir(exist_ok=True)
+    10	
+    11	LOG_FILE = LOG_DIR / "marc.log"
+    12	
+    13	
+    14	def get_logger(name: str) -> logging.Logger:
+    15	    """
+    16	    Create or return a configured logger.
+    17	    """
+    18	
+    19	    logger = logging.getLogger(name)
+    20	
+    21	    if logger.handlers:
+    22	        return logger
+    23	
+    24	    logger.setLevel(settings.LOG_LEVEL)
+    25	
+    26	    formatter = logging.Formatter(
+    27	        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    28	    )
+    29	
+    30	    # Console output
+    31	    console_handler = logging.StreamHandler()
+    32	    console_handler.setFormatter(formatter)
+    33	
+    34	    # File output
+    35	    file_handler = logging.FileHandler(LOG_FILE)
+    36	    file_handler.setFormatter(formatter)
+    37	
+    38	    logger.addHandler(console_handler)
+    39	    logger.addHandler(file_handler)
+    40	
+    41	    return logger
+================ ./backend/core/settings.py ==================
+     1	from dotenv import load_dotenv
+     2	import os
+     3	
+     4	# Load variables from the .env file
+     5	load_dotenv()
+     6	
+     7	
+     8	class Settings:
+     9	    """
+    10	    Central application settings.
+    11	    """
+    12	
+    13	    OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    14	    MODEL = os.getenv("MODEL", "llama3.2")
+    15	    TIMEOUT = int(os.getenv("TIMEOUT", 120))
+    16	    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    17	    DEBUG = os.getenv("DEBUG", "False") == "True"
+    18	
+    19	
+    20	# Global settings object
+    21	settings = Settings()
+================ ./backend/llm/__init__.py ==================
+
+================ ./backend/llm/base.py ==================
+     1	from abc import ABC, abstractmethod
+     2	
+     3	
+     4	class BaseLLM(ABC):
+     5	    @abstractmethod
+     6	    def generate(self, prompt: str) -> str:
+     7	        """Generate a response from the language model."""
+     8	        pass
+================ ./backend/llm/factory.py ==================
+     1	from backend.llm.models import LLMConfig
+     2	from backend.llm.ollama import OllamaClient
+     3	
+     4	
+     5	def create_llm():
+     6	    config = LLMConfig()
+     7	    return OllamaClient(config)
+================ ./backend/llm/models.py ==================
+     1	from dataclasses import dataclass
+     2	
+     3	
+     4	@dataclass
+     5	class LLMConfig:
+     6	    model: str = "llama3.2"
+     7	    host: str = "http://localhost:11434"
+     8	    temperature: float = 0.7
+================ ./backend/llm/ollama.py ==================
+     1	import time
+     2	import requests
+     3	
+     4	from backend.core.logger import get_logger
+     5	from backend.llm.models import LLMConfig
+     6	
+     7	
+     8	class OllamaClient:
+     9	    """
+    10	    Client for communicating with the local Ollama server.
+    11	    """
+    12	
+    13	    def __init__(self, config: LLMConfig | None = None):
+    14	        self.config = config or LLMConfig()
+    15	        self.logger = get_logger("LLM")
+    16	
+    17	    def generate(self, prompt: str) -> str:
+    18	        start = time.time()
+    19	
+    20	        self.logger.info("Request sent to Ollama")
+    21	
+    22	        url = f"{self.config.host}/api/generate"
+    23	
+    24	        payload = {
+    25	            "model": self.config.model,
+    26	            "prompt": prompt,
+    27	            "stream": False,
+    28	            "options": {
+    29	                "temperature": self.config.temperature,
+    30	            },
+    31	        }
+    32	
+    33	        try:
+    34	            response = requests.post(
+    35	                url,
+    36	                json=payload,
+    37	                timeout=120,
+    38	            )
+    39	
+    40	            response.raise_for_status()
+    41	
+    42	            result = response.json()["response"]
+    43	
+    44	            duration = round(time.time() - start, 2)
+    45	
+    46	            self.logger.info(
+    47	                f"Response received in {duration}s"
+    48	            )
+    49	
+    50	            return result
+    51	
+    52	        except Exception as e:
+    53	            self.logger.error(
+    54	                f"Ollama request failed: {e}"
+    55	            )
+    56	            raise
+================ ./backend/main.py ==================
+     1	from backend.pipeline.assistant import Assistant
+     2	def main():
+     3	    assistant = Assistant()
+     4	
+     5	    print("Jarvis started. Type 'exit' to quit.\n")
+     6	
+     7	    while True:
+     8	        user_input = input("User: ")
+     9	
+    10	        if user_input.lower() == "exit":
+    11	            break
+    12	
+    13	        response = assistant.chat(user_input)
+    14	        print(f"Jarvis: {response}\n")
+    15	
+    16	
+    17	if __name__ == "__main__":
+    18	    main()
+================ ./backend/pipeline/__init__.py ==================
+
+================ ./backend/pipeline/assistant.py ==================
+     1	from backend.core.logger import get_logger
+     2	from backend.llm.factory import create_llm
+     3	from backend.pipeline.intent_router import IntentRouter
+     4	from backend.tools.calculator import calculate
+     5	
+     6	
+     7	class Assistant:
+     8	    """
+     9	    Main Assistant Pipeline
+    10	
+    11	    Responsibilities:
+    12	    - Receive user input
+    13	    - Detect intent
+    14	    - Call tools if needed
+    15	    - Build prompts
+    16	    - Talk to the LLM
+    17	    - Maintain conversation memory
+    18	    - Summarize long conversations
+    19	    """
+    20	
+    21	    def __init__(self):
+    22	        self.llm = create_llm()
+    23	        self.router = IntentRouter()
+    24	        self.logger = get_logger("Assistant")
+    25	
+    26	        self.history = []
+    27	        self.summary = ""
+    28	
+    29	    def summarize_history(self) -> str:
+    30	        """
+    31	        Summarize older conversation history once it becomes large.
+    32	        """
+    33	
+    34	        if len(self.history) < 12:
+    35	            return self.summary
+    36	
+    37	        summary_input = "\n".join(
+    38	            f"{role}: {message}"
+    39	            for role, message in self.history[:-6]
+    40	        )
+    41	
+    42	        prompt = f"""
+    43	Summarize the following conversation.
+    44	
+    45	Keep only:
+    46	- Important facts
+    47	- User preferences
+    48	- Important context
+    49	
+    50	Ignore greetings and small talk.
+    51	
+    52	Conversation:
+    53	
+    54	{summary_input}
+    55	
+    56	Summary:
+    57	"""
+    58	
+    59	        try:
+    60	            summary = self.llm.generate(prompt).strip()
+    61	
+    62	            if summary:
+    63	                return summary
+    64	
+    65	            return self.summary
+    66	
+    67	        except Exception:
+    68	            return self.summary
+    69	
+    70	    def build_prompt(self, user_input: str) -> str:
+    71	        """
+    72	        Build the prompt sent to the LLM.
+    73	        """
+    74	
+    75	        new_summary = self.summarize_history()
+    76	
+    77	        if new_summary:
+    78	            self.summary = new_summary
+    79	
+    80	        recent_context = "\n".join(
+    81	            f"{role}: {message}"
+    82	            for role, message in self.history[-6:]
+    83	        )
+    84	
+    85	        system_prompt = """
+    86	You are Jarvis.
+    87	
+    88	Identity Rules:
+    89	- Your name is Jarvis.
+    90	- Never invent another identity.
+    91	- Never claim to be another person.
+    92	- Never say your name is Holden, ChatGPT, Claude, Gemini, or any other assistant.
+    93	- Stay in character.
+    94	
+    95	Communication Style:
+    96	- Professional
+    97	- Friendly
+    98	- Concise
+    99	- Helpful
+   100	
+   101	If the user calls you Jarvis,
+   102	respond naturally as Jarvis.
+   103	"""
+   104	
+   105	        return f"""
+   106	{system_prompt}
+   107	
+   108	Conversation Summary:
+   109	{self.summary}
+   110	
+   111	Recent Conversation:
+   112	{recent_context}
+   113	
+   114	User: {user_input}
+   115	Jarvis:
+   116	"""
+   117	
+   118	    def chat(self, user_input: str) -> str:
+   119	        """
+   120	        Main conversation pipeline.
+   121	        """
+   122	
+   123	        intent = self.router.classify(user_input)
+   124	
+   125	        self.logger.info(f"Intent: {intent}")
+   126	        self.logger.info(f"User input: {user_input}")
+   127	
+   128	        if intent == "tool":
+   129	            response = calculate(user_input)
+   130	
+   131	        else:
+   132	            prompt = self.build_prompt(user_input)
+   133	
+   134	            try:
+   135	                response = self.llm.generate(prompt)
+   136	
+   137	            except Exception as e:
+   138	                self.logger.error(f"LLM Error: {e}")
+   139	                response = "Sorry, I couldn't process that request."
+   140	
+   141	        self.history.append(("User", user_input))
+   142	        self.history.append(("Jarvis", response))
+   143	
+   144	        return response
+================ ./backend/pipeline/intent_router.py ==================
+     1	from backend.llm.ollama import OllamaClient
+     2	class IntentRouter:
+     3	    def __init__(self):
+     4	        self.llm = OllamaClient()
+     5	
+     6	    def classify(self, user_input: str) -> str:
+     7	        prompt = f"""
+     8	Classify the user input into ONE category only.
+     9	
+    10	Categories:
+    11	- tool (math, calculation, system operations)
+    12	- chat (normal conversation)
+    13	
+    14	Return ONLY one word: tool or chat.
+    15	
+    16	Input: {user_input}
+    17	"""
+    18	
+    19	        result = self.llm.generate(prompt).strip().lower()
+    20	
+    21	        if "tool" in result:
+    22	            return "tool"
+    23	
+    24	        return "chat"
+================ ./backend/pipeline/router.py ==================
+     1	from tools.calculator import calculate
+     2	
+     3	
+     4	def route(user_input: str):
+     5	    # VERY SIMPLE INTENT DETECTION FIRST
+     6	    math_keywords = ["+", "-", "*", "/", "calculate", "multiply", "add"]
+     7	
+     8	    if any(k in user_input for k in math_keywords):
+     9	        return "tool", calculate(user_input)
+    10	
+    11	    return "llm", None
+================ ./backend/pipeline/voice_pipeline.py ==================
+     1	from backend.audio.stream_recorder import StreamRecorder
+     2	from backend.audio.playback_manager import PlaybackManager
+     3	from backend.pipeline.assistant import Assistant
+     4	from backend.stt.whisper import WhisperSTT
+     5	from backend.core.logger import get_logger
+     6	from backend.wakeword.detector import WakeWordDetector
+     7	from backend.state.conversation import ConversationManager
+     8	from backend.runtime.component import Component
+     9	
+    10	
+    11	class VoicePipeline(Component):
+    12	    """
+    13	    MARC Voice Pipeline
+    14	    """
+    15	
+    16	    def __init__(self):
+    17	        super().__init__()
+    18	        self.logger = get_logger("VoicePipeline")
+    19	        self.name = "voice_pipeline"
+    20	        self.running = False
+    21	        self.event_bus = None
+    22	
+    23	        self.recorder = StreamRecorder()
+    24	        self.stt = WhisperSTT()
+    25	        self.assistant = Assistant()
+    26	        self.wakeword = WakeWordDetector()
+    27	        self.conversation = ConversationManager(timeout=20)
+    28	
+    29	        # All audio playback goes through this manager
+    30	        self.playback = PlaybackManager(
+    31	    model_path="/Users/ayushsharma/Downloads/en_US-lessac-medium.onnx",
+    32	)
+    33	
+    34	    # ----------------------------------------
+    35	    # Voice Commands
+    36	    # ----------------------------------------
+    37	
+    38	    EXIT_COMMANDS = {
+    39	        "exit",
+    40	        "quit",
+    41	        "shutdown",
+    42	        "goodbye",
+    43	        "stop marc",
+    44	    }
+    45	
+    46	    SLEEP_COMMANDS = {
+    47	        "sleep",
+    48	        "go to sleep",
+    49	        "stop listening",
+    50	    }
+    51	
+    52	    def update(self, event=None):
+    53	        """
+    54	        Run one complete voice interaction.
+    55	        """
+    56	
+    57	        try:
+    58	
+    59	            # ----------------------------------------
+    60	            # Conversation timeout
+    61	            # ----------------------------------------
+    62	            if (
+    63	                self.conversation.is_active()
+    64	                and self.conversation.has_timed_out()
+    65	            ):
+    66	                self.logger.info("Conversation timed out.")
+    67	
+    68	                self.conversation.deactivate()
+    69	
+    70	                print("\nMARC: Going back to sleep.\n")
+    71	
+    72	                self.playback.speak("Going back to sleep.")
+    73	
+    74	                return
+    75	
+    76	            # ----------------------------------------
+    77	            # Listen
+    78	            # ----------------------------------------
+    79	            self.logger.info("Listening for speech...")
+    80	
+    81	            audio_file = self.recorder.record()
+    82	
+    83	            if audio_file is None:
+    84	                return
+    85	
+    86	            # ----------------------------------------
+    87	            # Speech-to-Text
+    88	            # ----------------------------------------
+    89	            self.logger.info("Transcribing audio...")
+    90	
+    91	            user_text = self.stt.transcribe(audio_file)
+    92	
+    93	            if not user_text or not user_text.strip():
+    94	                return
+    95	
+    96	            print(f"\nYou : {user_text}")
+    97	
+    98	            # Keep original text for the LLM
+    99	            original_text = user_text.strip()
+   100	
+   101	            # Normalized version for wake words and commands
+   102	            normalized = " ".join(
+   103	                original_text.lower().split()
+   104	            )
+   105	
+   106	            # ----------------------------------------
+   107	            # Sleeping mode
+   108	            # ----------------------------------------
+   109	            if not self.conversation.is_active():
+   110	
+   111	                activated, cleaned_text = self.wakeword.detect(normalized)
+   112	
+   113	                if not activated:
+   114	
+   115	                    self.logger.info("Wake word not detected.")
+   116	
+   117	                    print("\nWaiting for wake word...\n")
+   118	
+   119	                    return
+   120	
+   121	                self.logger.info("Wake word detected.")
+   122	
+   123	                self.conversation.activate()
+   124	
+   125	                if cleaned_text == "":
+   126	
+   127	                    print("\nMARC: Yes?\n")
+   128	
+   129	                    self.playback.speak("Yes?")
+   130	
+   131	                    return
+   132	
+   133	                normalized = cleaned_text
+   134	                original_text = cleaned_text
+   135	
+   136	                print(f"\nCommand : {cleaned_text}")
+   137	
+   138	            else:
+   139	
+   140	                self.logger.info("Conversation active")
+   141	
+   142	                self.conversation.refresh()
+   143	
+   144	            # ----------------------------------------
+   145	            # Voice Commands
+   146	            # ----------------------------------------
+   147	            if normalized in self.EXIT_COMMANDS:
+   148	
+   149	                self.logger.info("Exit command received.")
+   150	
+   151	                self.playback.speak("Shutting down.")
+   152	
+   153	                raise KeyboardInterrupt
+   154	
+   155	            if normalized in self.SLEEP_COMMANDS:
+   156	
+   157	                self.logger.info("Sleep command received.")
+   158	
+   159	                self.conversation.deactivate()
+   160	
+   161	                self.playback.speak("Going back to sleep.")
+   162	
+   163	                return
+   164	
+   165	            # ----------------------------------------
+   166	            # Assistant
+   167	            # ----------------------------------------
+   168	            self.logger.info("Generating response...")
+   169	
+   170	            response = self.assistant.chat(user_text)
+   171	
+   172	            if not response:
+   173	              return
+   174	
+   175	            print(f"\nMARC: {response}")
+   176	
+   177	# Speak the response (blocking until speech is finished)
+   178	            self.playback.speak(response)
+   179	
+   180	# NOW restart the conversation timeout
+   181	            self.conversation.refresh()
+   182	
+   183	
+   184	            print("\n----------------------------------------")
+   185	
+   186	        except KeyboardInterrupt:
+   187	
+   188	            self.logger.info("Interrupted by user.")
+   189	
+   190	            raise
+   191	
+   192	        except Exception as e:
+   193	
+   194	            self.logger.exception(f"Voice pipeline failed: {e}")
+   195	    def start(self):
+   196	     self.running = True
+   197	     self.logger.info("VoicePipeline started")
+   198	    def stop(self):
+   199	     self.running = False
+   200	     self.logger.info("VoicePipeline stopped")
+================ ./backend/run_voice.py ==================
+     1	from backend.runtime.bootstrap import build_system
+     2	
+     3	
+     4	def main():
+     5	    engine = build_system()
+     6	
+     7	    engine.start()
+     8	    engine.run()
+     9	
+    10	
+    11	if __name__ == "__main__":
+    12	    main()
+================ ./backend/runtime/bootstrap.py ==================
+     1	from backend.runtime.event_bus import EventBus
+     2	from backend.brain.brain import Brain
+     3	from backend.audio.stream_recorder import StreamRecorder
+     4	from backend.stt.whisper import WhisperSTT
+     5	from backend.audio.playback_manager import PlaybackManager
+     6	from backend.runtime.event import Event
+     7	from backend.core.logger import get_logger
+     8	from backend.audio.audio_state import AudioState
+     9	
+    10	
+    11	class Bootstrap:
+    12	
+    13	    def __init__(self):
+    14	        self.logger = get_logger("Bootstrap")
+    15	
+    16	        self.bus = EventBus()
+    17	        self.state = AudioState()
+    18	
+    19	        self.brain = Brain(self.bus)
+    20	        self.recorder = StreamRecorder()
+    21	        self.stt = WhisperSTT()
+    22	
+    23	        self.tts = PlaybackManager(
+    24	            model_path="/Users/ayushsharma/Downloads/en_US-lessac-medium.onnx"
+    25	        )
+    26	
+    27	    def start(self):
+    28	
+    29	        self.logger.info("MARC FULL DUPLEX MODE STARTED")
+    30	
+    31	        self.brain.start()
+    32	
+    33	        # RESPONSE HANDLER
+    34	        def handle_response(event: Event):
+    35	
+    36	            text = event.data.get("text")
+    37	            if not text:
+    38	                return
+    39	
+    40	            print(f"\nMARC: {text}")
+    41	
+    42	            self.tts.speak(text, self.state)
+    43	
+    44	        self.bus.subscribe("response.generated", handle_response)
+    45	
+    46	        # AUDIO CALLBACK
+    47	        def on_audio(file):
+    48	
+    49	            text = self.stt.transcribe(file)
+    50	
+    51	            if not text:
+    52	                return
+    53	
+    54	            print(f"\nUSER: {text}")
+    55	
+    56	            self.bus.publish(
+    57	                Event(
+    58	                    type="text.recognized",
+    59	                    data={"text": text},
+    60	                    source="stt"
+    61	                )
+    62	            )
+    63	
+    64	        # START STREAMING MIC LOOP
+    65	        self.recorder.listen_stream(on_audio)
+================ ./backend/runtime/component.py ==================
+     1	from abc import ABC, abstractmethod
+     2	
+     3	
+     4	class Component(ABC):
+     5	    """
+     6	    Base Component for MARC v2
+     7	
+     8	    Every system module must follow this lifecycle:
+     9	    - start()
+    10	    - update()
+    11	    - stop()
+    12	    """
+    13	
+    14	    def __init__(self, name: str):
+    15	        self.name = name
+    16	        self.running = False
+    17	
+    18	    # ------------------------------------
+    19	    # Lifecycle Methods
+    20	    # ------------------------------------
+    21	
+    22	    @abstractmethod
+    23	    def start(self):
+    24	        """
+    25	        Called once when engine starts.
+    26	        """
+    27	        self.running = True
+    28	
+    29	    @abstractmethod
+    30	    def update(self):
+    31	        """
+    32	        Called repeatedly by engine loop.
+    33	        """
+    34	        pass
+    35	
+    36	    @abstractmethod
+    37	    def stop(self):
+    38	        """
+    39	        Called when engine shuts down.
+    40	        """
+    41	        self.running = False
+================ ./backend/runtime/engine.py ==================
+     1	from backend.core.logger import get_logger
+     2	from backend.runtime.event_bus import EventBus
+     3	
+     4	
+     5	class Engine:
+     6	    """
+     7	    MARC Runtime Engine
+     8	
+     9	    Responsibilities:
+    10	    - Manage lifecycle of all components
+    11	    - Run update loop
+    12	    - Provide event bus communication layer
+    13	    """
+    14	
+    15	    def __init__(self):
+    16	        self.logger = get_logger("Engine")
+    17	
+    18	        self.bus = EventBus()
+    19	
+    20	        self.components = []
+    21	        self.running = False
+    22	
+    23	    # ------------------------------------
+    24	    # Component Management
+    25	    # ------------------------------------
+    26	
+    27	    def register(self, component):
+    28	        """
+    29	        Add a runtime component.
+    30	        """
+    31	        self.components.append(component)
+    32	        self.logger.info(f"Registered component: {component.name}")
+    33	
+    34	    # ------------------------------------
+    35	    # Lifecycle
+    36	    # ------------------------------------
+    37	
+    38	    def start(self):
+    39	        """
+    40	        Start all components.
+    41	        """
+    42	        self.logger.info("Starting MARC Engine...")
+    43	
+    44	        self.running = True
+    45	
+    46	        for c in self.components:
+    47	            try:
+    48	                c.start()
+    49	            except Exception as e:
+    50	                self.logger.exception(
+    51	                    f"Failed to start {c.name}: {e}"
+    52	                )
+    53	
+    54	        self.logger.info("Engine started successfully.")
+    55	
+    56	    def run(self):
+    57	        """
+    58	        Main loop.
+    59	        """
+    60	        self.logger.info("Engine running...")
+    61	
+    62	        while self.running:
+    63	
+    64	            try:
+    65	                for c in self.components:
+    66	                    c.update()
+    67	
+    68	            except KeyboardInterrupt:
+    69	                self.logger.info("Shutdown requested by user.")
+    70	                self.stop()
+    71	
+    72	            except Exception as e:
+    73	                self.logger.exception(f"Engine crash: {e}")
+    74	
+    75	                # You can decide:
+    76	                # stop or continue
+    77	                self.stop()
+    78	
+    79	    def stop(self):
+    80	        """
+    81	        Shutdown all components safely.
+    82	        """
+    83	        self.logger.info("Stopping MARC Engine...")
+    84	
+    85	        self.running = False
+    86	
+    87	        for c in reversed(self.components):
+    88	            try:
+    89	                c.stop()
+    90	            except Exception as e:
+    91	                self.logger.exception(
+    92	                    f"Error stopping {c.name}: {e}"
+    93	                )
+    94	
+    95	        self.logger.info("Engine stopped cleanly.")
+================ ./backend/runtime/event.py ==================
+     1	class Events:
+     2	
+     3	    AUDIO_RECORDED = "audio.recorded"
+     4	
+     5	    SPEECH_TRANSCRIBED = "speech.transcribed"
+     6	
+     7	    RESPONSE_GENERATED = "response.generated"
+     8	
+     9	    TTS_STARTED = "tts.started"
+    10	
+    11	    TTS_FINISHED = "tts.finished"
+    12	
+    13	    WAKEWORD_DETECTED = "wakeword.detected"
+    14	
+    15	    USER_STARTED_SPEAKING = "user.started"
+    16	
+    17	    USER_STOPPED_SPEAKING = "user.stopped"
+    18	
+    19	    SYSTEM_SHUTDOWN = "system.shutdown"
+================ ./backend/runtime/event_bus.py ==================
+     1	from collections import defaultdict
+     2	from typing import Callable, Dict, List
+     3	from backend.runtime.event import Event
+     4	
+     5	
+     6	class EventBus:
+     7	    """
+     8	    Simple synchronous event bus (upgrade later to async).
+     9	    """
+    10	
+    11	    def __init__(self):
+    12	        self.subscribers: Dict[str, List[Callable]] = defaultdict(list)
+    13	
+    14	    def subscribe(self, event_type: str, handler: Callable):
+    15	        self.subscribers[event_type].append(handler)
+    16	
+    17	    def unsubscribe(self, event_type: str, handler: Callable):
+    18	        if handler in self.subscribers[event_type]:
+    19	            self.subscribers[event_type].remove(handler)
+    20	
+    21	    def publish(self, event: Event):
+    22	        handlers = self.subscribers.get(event.type, [])
+    23	
+    24	        for handler in handlers:
+    25	            try:
+    26	                handler(event)
+    27	            except Exception as e:
+    28	                print(f"[EventBus] Handler error: {e}")
+================ ./backend/skills/__init__.py ==================
+
+================ ./backend/skills/base.py ==================
+     1	from abc import ABC, abstractmethod
+     2	from typing import Any
+     3	
+     4	
+     5	class Skill(ABC):
+     6	    """
+     7	    Base class for every MARC skill.
+     8	
+     9	    Every capability (LLM, Calculator, Browser, Vision, etc.)
+    10	    inherits from this class.
+    11	    """
+    12	
+    13	    name: str = ""
+    14	    description: str = ""
+    15	
+    16	    @abstractmethod
+    17	    def execute(self, **kwargs) -> Any:
+    18	        """
+    19	        Execute the skill.
+    20	
+    21	        Returns the result produced by the skill.
+    22	        """
+    23	        pass
+================ ./backend/skills/browser.py ==================
+
+================ ./backend/skills/calculator.py ==================
+     1	from backend.skills.base import Skill
+     2	from backend.tools.calculator import calculate
+     3	
+     4	
+     5	class CalculatorSkill(Skill):
+     6	
+     7	    name = "calculator"
+     8	
+     9	    description = "Evaluates mathematical expressions."
+    10	
+    11	    def execute(self, **kwargs):
+    12	
+    13	        expression = kwargs["expression"]
+    14	
+    15	        return calculate(expression)
+================ ./backend/skills/filesystem.py ==================
+
+================ ./backend/skills/llm.py ==================
+     1	from backend.skills.base import Skill
+     2	from backend.llm.factory import create_llm
+     3	
+     4	
+     5	class LLMSkill(Skill):
+     6	
+     7	    name = "llm"
+     8	
+     9	    description = "Generates natural language."
+    10	
+    11	    def __init__(self):
+    12	
+    13	        self.model = create_llm()
+    14	
+    15	    def execute(self, **kwargs):
+    16	
+    17	        prompt = kwargs["prompt"]
+    18	
+    19	        return self.model.generate(prompt)
+================ ./backend/skills/registry.py ==================
+     1	from backend.skills.calculator import CalculatorSkill
+     2	from backend.skills.llm import LLMSkill
+     3	
+     4	
+     5	class SkillRegistry:
+     6	    """
+     7	    Stores and executes all available skills.
+     8	    """
+     9	
+    10	    def __init__(self):
+    11	        self.skills = {}
+    12	        self.register(CalculatorSkill())
+    13	        self.register(LLMSkill())
+    14	
+    15	    def register(self, skill):
+    16	        self.skills[skill.name] = skill
+    17	
+    18	    def get(self, name):
+    19	        return self.skills.get(name)
+    20	
+    21	    def execute(self, name, text):
+    22	        skill = self.get(name)
+    23	
+    24	        if skill is None:
+    25	            raise ValueError(f"Unknown skill: {name}")
+    26	
+    27	        return skill.execute(text)
+================ ./backend/skills/terminal.py ==================
+
+================ ./backend/skills/vision.py ==================
+
+================ ./backend/state/__init__.py ==================
+
+================ ./backend/state/conversation.py ==================
+     1	import time
+     2	
+     3	try:
+     4	    from backend.core.logger import get_logger
+     5	except ModuleNotFoundError:
+     6	    import sys
+     7	    from pathlib import Path
+     8	
+     9	    project_root = Path(__file__).resolve().parents[2]
+    10	    sys.path.append(str(project_root))
+    11	
+    12	    from backend.core.logger import get_logger
+    13	
+    14	
+    15	class ConversationManager:
+    16	    """
+    17	    Manages:
+    18	    - Active / Sleep state
+    19	    - Timeout handling
+    20	    - Voice commands (sleep/exit)
+    21	    """
+    22	
+    23	    def __init__(self, timeout: int = 60):
+    24	        self.logger = get_logger("ConversationManager")
+    25	
+    26	        self._active = False
+    27	        self.timeout = timeout
+    28	        self.last_interaction = None
+    29	
+    30	    # -------------------------
+    31	    # State control
+    32	    # -------------------------
+    33	
+    34	    def activate(self):
+    35	        self._active = True
+    36	        self.refresh()
+    37	        self.logger.info("Conversation activated.")
+    38	
+    39	    def deactivate(self):
+    40	        if self._active:
+    41	            self.logger.info("Conversation ended.")
+    42	
+    43	        self._active = False
+    44	        self.last_interaction = None
+    45	
+    46	    def is_active(self) -> bool:
+    47	        return self._active
+    48	
+    49	    # -------------------------
+    50	    # Timeout logic
+    51	    # -------------------------
+    52	
+    53	    def refresh(self):
+    54	        self.last_interaction = time.time()
+    55	
+    56	    def has_timed_out(self) -> bool:
+    57	        if not self._active or self.last_interaction is None:
+    58	            return False
+    59	
+    60	        return (time.time() - self.last_interaction) > self.timeout
+    61	
+    62	    # -------------------------
+    63	    # NEW: Voice command handler
+    64	    # -------------------------
+    65	
+    66	    EXIT_COMMANDS = {
+    67	        "exit",
+    68	        "quit",
+    69	        "shutdown",
+    70	        "goodbye",
+    71	        "stop",
+    72	        "stop listening",
+    73	    }
+    74	
+    75	    SLEEP_COMMANDS = {
+    76	        "sleep",
+    77	        "go to sleep",
+    78	        "go sleep",
+    79	        "rest",
+    80	    }
+    81	
+    82	    def handle_commands(self, text: str):
+    83	        """
+    84	        Returns:
+    85	        - "exit" → shutdown program
+    86	        - "sleep" → go inactive
+    87	        - None → normal flow
+    88	        """
+    89	
+    90	        if not text:
+    91	            return None
+    92	
+    93	        t = text.lower().strip()
+    94	
+    95	        if t in self.EXIT_COMMANDS:
+    96	            self.logger.info("Exit command detected.")
+    97	            return "exit"
+    98	
+    99	        if t in self.SLEEP_COMMANDS:
+   100	            self.logger.info("Sleep command detected.")
+   101	            return "sleep"
+   102	
+   103	        return None
+================ ./backend/stt/__init__.py ==================
+
+================ ./backend/stt/whisper.py ==================
+     1	from pathlib import Path
+     2	import time
+     3	
+     4	from faster_whisper import WhisperModel
+     5	
+     6	from backend.core.logger import get_logger
+     7	
+     8	
+     9	class WhisperSTT:
+    10	    """
+    11	    Speech-to-Text using Faster-Whisper.
+    12	
+    13	    Optimized for a real-time voice assistant.
+    14	    """
+    15	
+    16	    def __init__(
+    17	        self,
+    18	        model_size: str = "base",
+    19	        device: str = "auto",
+    20	        compute_type: str = "int8",
+    21	    ):
+    22	        self.logger = get_logger("Whisper")
+    23	
+    24	        self.logger.info("Loading Faster-Whisper model...")
+    25	
+    26	        start = time.time()
+    27	
+    28	        self.model = WhisperModel(
+    29	            model_size_or_path=model_size,
+    30	            device=device,
+    31	            compute_type=compute_type,
+    32	        )
+    33	
+    34	        elapsed = time.time() - start
+    35	
+    36	        self.logger.info(
+    37	            f"Whisper model loaded in {elapsed:.2f}s"
+    38	        )
+    39	
+    40	    def transcribe(self, audio_path: str | Path) -> str:
+    41	        """
+    42	        Transcribe a WAV audio file.
+    43	        """
+    44	
+    45	        audio_path = Path(audio_path)
+    46	
+    47	        if not audio_path.exists():
+    48	            raise FileNotFoundError(
+    49	                f"Audio file not found: {audio_path}"
+    50	            )
+    51	
+    52	        self.logger.info(
+    53	            f"Transcribing {audio_path.name}"
+    54	        )
+    55	
+    56	        start = time.time()
+    57	
+    58	        segments, info = self.model.transcribe(
+    59	             str(audio_path),
+    60	
+    61	    # Fastest decoding
+    62	      beam_size=1,
+    63	     best_of=1,
+    64	
+    65	    # Fixed language
+    66	     language="en",
+    67	
+    68	    # Not needed for a voice assistant
+    69	    word_timestamps=False,
+    70	
+    71	    # Prevent previous context from affecting the result
+    72	    condition_on_previous_text=False,
+    73	        )
+    74	
+    75	        text = " ".join(
+    76	            segment.text.strip()
+    77	            for segment in segments
+    78	        ).strip()
+    79	
+    80	        elapsed = time.time() - start
+    81	
+    82	        self.logger.info(
+    83	            f"Language: {info.language}"
+    84	        )
+    85	
+    86	        self.logger.info(
+    87	            f"Transcription completed in {elapsed:.2f}s"
+    88	        )
+    89	
+    90	        return text
+    91	
+    92	
+    93	if __name__ == "__main__":
+    94	
+    95	    audio_file = (
+    96	        Path(__file__).resolve().parent.parent.parent
+    97	        / "recordings"
+    98	        / "output.wav"
+    99	    )
+   100	
+   101	    stt = WhisperSTT()
+   102	
+   103	    print("\nTranscribing...\n")
+   104	
+   105	    result = stt.transcribe(audio_file)
+   106	
+   107	    print("\nYou said:")
+   108	    print(result)
+================ ./backend/test_logger.py ==================
+     1	from core.logger import get_logger
+     2	
+     3	logger = get_logger("MARC")
+     4	
+     5	logger.info("System started")
+     6	logger.warning("This is a warning")
+     7	logger.error("This is an error")
+================ ./backend/test_microphone.py ==================
+     1	from backend.audio.microphone import Microphone
+     2	
+     3	mic = Microphone()
+     4	
+     5	print("Available devices:")
+     6	mic.list_devices()
+     7	
+     8	print("\nRecording...")
+     9	
+    10	audio = mic.record(5)
+    11	
+    12	print(audio.shape)
+    13	print("Done!")
+================ ./backend/test_settings.py ==================
+     1	from core.logger import get_logger
+     2	import time
+     3	
+     4	logger = get_logger("MARC")
+     5	
+     6	logger.info("Boot sequence initiated")
+     7	time.sleep(1)
+     8	
+     9	logger.info("Loading modules...")
+    10	time.sleep(1)
+    11	
+    12	logger.warning("Microphone not detected")
+    13	time.sleep(1)
+    14	
+    15	logger.error("Failed to connect to LLM backend")
+================ ./backend/test_vad.py ==================
+     1	import sounddevice as sd
+     2	import numpy as np
+     3	
+     4	from backend.audio.vad import VoiceActivityDetector
+     5	
+     6	
+     7	SAMPLE_RATE = 16000
+     8	CHUNK_MS = 30
+     9	
+    10	# Number of samples in a 30 ms chunk
+    11	CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_MS / 1000)
+    12	
+    13	vad = VoiceActivityDetector(threshold=0.04)
+    14	
+    15	print("=" * 40)
+    16	print("Simple Voice Activity Detection Test")
+    17	print("=" * 40)
+    18	print("Speak into the microphone.")
+    19	print("Press Ctrl+C to stop.\n")
+    20	
+    21	
+    22	def callback(indata, frames, time, status):
+    23	    if status:
+    24	        print(status)
+    25	
+    26	    audio = np.squeeze(indata)
+    27	
+    28	    energy = vad.rms(audio)
+    29	
+    30	    if vad.is_speech(audio):
+    31	        state = "🟢 SPEECH"
+    32	    else:
+    33	        state = "⚪ SILENCE"
+    34	
+    35	    print(f"Energy: {energy:.5f}  {state}")
+    36	
+    37	
+    38	try:
+    39	    with sd.InputStream(
+    40	        samplerate=SAMPLE_RATE,
+    41	        channels=1,
+    42	        blocksize=CHUNK_SIZE,
+    43	        dtype="float32",
+    44	        callback=callback,
+    45	    ):
+    46	        while True:
+    47	            sd.sleep(100)
+    48	
+    49	except KeyboardInterrupt:
+    50	    print("\nStopped.")
+================ ./backend/test_wakeword.py ==================
+     1	from backend.wakeword.detector import WakeWordDetector
+     2	
+     3	detector = WakeWordDetector()
+     4	
+     5	tests = [
+     6	    "Hello MARC",
+     7	    "Hey MARC",
+     8	    "Hi MARC",
+     9	    "Ok MARC",
+    10	    "Okay MARC",
+    11	    "MARC",
+    12	    "What is Python?",
+    13	    "Tell me a joke",
+    14	    "",
+    15	]
+    16	
+    17	for text in tests:
+    18	    print(f"{text!r:25} -> {detector.detect(text)}")
+================ ./backend/tools/calculator.py ==================
+     1	def calculate(expression: str):
+     2	    try:
+     3	        return str(eval(expression))
+     4	    except:
+     5	        return "Invalid expression"
+================ ./backend/tts/__init__.py ==================
+
+================ ./backend/tts/piper.py ==================
+     1	from pathlib import Path
+     2	import subprocess
+     3	import tempfile
+     4	from threading import Lock
+     5	
+     6	from backend.core.logger import get_logger
+     7	
+     8	
+     9	class PiperTTS:
+    10	    """
+    11	    Offline Text-to-Speech using Piper.
+    12	
+    13	    Features
+    14	    --------
+    15	    - Thread-safe playback
+    16	    - Interruptible speech
+    17	    - Prevents overlapping audio
+    18	    - Ready for streaming responses
+    19	    """
+    20	
+    21	    def __init__(
+    22	        self,
+    23	        model_path: str = "/Users/ayushsharma/Downloads/en_US-lessac-medium.onnx",
+    24	    ):
+    25	        self.logger = get_logger("PiperTTS")
+    26	
+    27	        self.model_path = Path(model_path)
+    28	
+    29	        if not self.model_path.exists():
+    30	            raise FileNotFoundError(
+    31	                f"Model not found: {self.model_path}"
+    32	            )
+    33	
+    34	        # afplay process
+    35	        self.player = None
+    36	
+    37	        # Prevent multiple playback threads
+    38	        self.lock = Lock()
+    39	
+    40	        self.logger.info("Piper TTS initialized")
+    41	
+    42	    def speak(self, text: str):
+    43	        """
+    44	        Convert text to speech and play it.
+    45	
+    46	        If another speech is already playing,
+    47	        stop it first.
+    48	        """
+    49	
+    50	        if not text or not text.strip():
+    51	            return
+    52	
+    53	        text = text.strip()
+    54	
+    55	        with self.lock:
+    56	
+    57	            # Interrupt previous playback
+    58	            self.stop()
+    59	
+    60	            self.logger.info(f"TTS Input: {text}")
+    61	
+    62	            with tempfile.NamedTemporaryFile(
+    63	                suffix=".wav",
+    64	                delete=False,
+    65	            ) as tmp:
+    66	
+    67	                output_wav = tmp.name
+    68	
+    69	            try:
+    70	
+    71	                # -------------------------
+    72	                # Generate speech
+    73	                # -------------------------
+    74	                cmd = [
+    75	                    "piper",
+    76	                    "--model",
+    77	                    str(self.model_path),
+    78	                    "--output_file",
+    79	                    output_wav,
+    80	                ]
+    81	
+    82	                process = subprocess.Popen(
+    83	                    cmd,
+    84	                    stdin=subprocess.PIPE,
+    85	                    stdout=subprocess.PIPE,
+    86	                    stderr=subprocess.PIPE,
+    87	                    text=True,
+    88	                )
+    89	
+    90	                _, stderr = process.communicate(
+    91	                    input=text
+    92	                )
+    93	
+    94	                if process.returncode != 0:
+    95	                    self.logger.error(
+    96	                        f"Piper failed:\n{stderr}"
+    97	                    )
+    98	                    return
+    99	
+   100	                # -------------------------
+   101	                # Play audio
+   102	                # -------------------------
+   103	                self.player = subprocess.Popen(
+   104	                    ["afplay", output_wav],
+   105	                    stdout=subprocess.DEVNULL,
+   106	                    stderr=subprocess.DEVNULL,
+   107	                )
+   108	
+   109	                self.logger.info(
+   110	                    "Playback started"
+   111	                )
+   112	
+   113	                self.player.wait()
+   114	
+   115	                self.logger.info(
+   116	                    "Playback finished"
+   117	                )
+   118	
+   119	            finally:
+   120	
+   121	                self.player = None
+   122	
+   123	                try:
+   124	                    Path(output_wav).unlink(
+   125	                        missing_ok=True
+   126	                    )
+   127	                except Exception:
+   128	                    pass
+   129	
+   130	    def stop(self):
+   131	        """
+   132	        Stop current playback immediately.
+   133	        """
+   134	
+   135	        if (
+   136	            self.player is not None
+   137	            and self.player.poll() is None
+   138	        ):
+   139	
+   140	            self.logger.info(
+   141	                "Stopping playback..."
+   142	            )
+   143	
+   144	            try:
+   145	
+   146	                self.player.terminate()
+   147	
+   148	                self.player.wait(timeout=1)
+   149	
+   150	            except Exception:
+   151	
+   152	                self.player.kill()
+   153	
+   154	            finally:
+   155	
+   156	                self.player = None
+   157	
+   158	    def is_playing(self) -> bool:
+   159	        """
+   160	        Returns True if Piper is currently speaking.
+   161	        """
+   162	
+   163	        return (
+   164	            self.player is not None
+   165	            and self.player.poll() is None
+   166	        )
+================ ./backend/tts/test_tts.py ==================
+     1	import sys
+     2	from pathlib import Path
+     3	
+     4	# 🔥 FORCE PROJECT ROOT (ABSOLUTE RELIABLE FIX)
+     5	ROOT = Path(__file__).resolve().parents[2]
+     6	sys.path.insert(0, str(ROOT))
+     7	
+     8	print("ROOT PATH:", ROOT)
+     9	
+    10	# NOW IMPORT
+    11	from jarvis.backend.tts.piper import PiperTTS
+    12	
+    13	
+    14	def main():
+    15	    tts = PiperTTS()
+    16	    tts.speak("Hello MARC is now working correctly")
+    17	
+    18	
+    19	if __name__ == "__main__":
+    20	    main()
+================ ./backend/utils/__init__.py ==================
+
+================ ./backend/wakeword/__init__.py ==================
+
+================ ./backend/wakeword/detector.py ==================
+     1	import re
+     2	
+     3	
+     4	class WakeWordDetector:
+     5	    """
+     6	    Detects wake words and removes them
+     7	    from the beginning of the user's speech.
+     8	    """
+     9	
+    10	    WAKE_WORDS = (
+    11	        "jarvis",
+    12	        "hello jarvis",
+    13	        "hi jarvis",
+    14	        "ok jarvis",
+    15	        "okay jarvis",
+    16	        "hey jarvis",
+    17	        "hey marc",
+    18	        "marc",
+    19	        "hey",
+    20	    )
+    21	
+    22	    def detect(self, text: str) -> tuple[bool, str]:
+    23	        """
+    24	        Returns
+    25	        -------
+    26	        (activated, cleaned_text)
+    27	        """
+    28	
+    29	        if not text:
+    30	            return False, ""
+    31	
+    32	        text = self._normalize(text)
+    33	
+    34	        for wake_word in sorted(
+    35	            self.WAKE_WORDS,
+    36	            key=len,
+    37	            reverse=True,
+    38	        ):
+    39	
+    40	            if text.startswith(wake_word):
+    41	
+    42	                cleaned = text[len(wake_word):].strip()
+    43	
+    44	                return True, cleaned
+    45	
+    46	        return False, text
+    47	
+    48	    @staticmethod
+    49	    def _normalize(text: str) -> str:
+    50	
+    51	        text = text.lower()
+    52	
+    53	        text = re.sub(r"[^\w\s]", "", text)
+    54	
+    55	        text = " ".join(text.split())
+    56	
+    57	        return text

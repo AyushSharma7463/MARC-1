@@ -1,0 +1,807 @@
+================ SPRINT 4 BACKUP ================
+
+================ backend/run_voice.py ==================
+📄 FILE SIZE:      679 bytes
+
+from backend.pipeline.voice_pipeline import VoicePipeline
+from backend.core.logger import get_logger
+
+
+logger = get_logger("RunVoice")
+
+
+def main():
+    """
+    Continuous Voice Assistant
+    """
+
+    logger.info("=" * 60)
+    logger.info("Starting MARC Voice Assistant")
+    logger.info("=" * 60)
+
+    pipeline = VoicePipeline()
+
+    try:
+
+        while True:
+
+            pipeline.run()
+
+            print()
+
+    except KeyboardInterrupt:
+     logger.info("Stopping MARC...")
+     print("\nGoodbye!")
+
+    except Exception as e:
+
+        logger.exception(f"Fatal Error: {e}")
+
+    finally:
+
+        logger.info("Voice Assistant Closed.")
+
+
+if __name__ == "__main__":
+    main()
+================ backend/pipeline/voice_pipeline.py ==================
+📄 FILE SIZE:     5129 bytes
+
+from backend.audio.stream_recorder import StreamRecorder
+from backend.audio.playback_manager import PlaybackManager
+from backend.pipeline.assistant import Assistant
+from backend.stt.whisper import WhisperSTT
+from backend.core.logger import get_logger
+from backend.wakeword.detector import WakeWordDetector
+from backend.state.conversation import ConversationManager
+
+
+
+class VoicePipeline:
+    """
+    MARC Voice Pipeline
+    """
+
+    def __init__(self):
+        self.logger = get_logger("VoicePipeline")
+
+        self.recorder = StreamRecorder()
+        self.stt = WhisperSTT()
+        self.assistant = Assistant()
+        self.wakeword = WakeWordDetector()
+        self.conversation = ConversationManager(timeout=20)
+
+        # All audio playback goes through this manager
+        self.playback = PlaybackManager(
+    model_path="/Users/ayushsharma/Downloads/en_US-lessac-medium.onnx",
+)
+
+    # ----------------------------------------
+    # Voice Commands
+    # ----------------------------------------
+
+    EXIT_COMMANDS = {
+        "exit",
+        "quit",
+        "shutdown",
+        "goodbye",
+        "stop marc",
+    }
+
+    SLEEP_COMMANDS = {
+        "sleep",
+        "go to sleep",
+        "stop listening",
+    }
+
+    def run(self):
+        """
+        Run one complete voice interaction.
+        """
+
+        try:
+
+            # ----------------------------------------
+            # Conversation timeout
+            # ----------------------------------------
+            if (
+                self.conversation.is_active()
+                and self.conversation.has_timed_out()
+            ):
+                self.logger.info("Conversation timed out.")
+
+                self.conversation.deactivate()
+
+                print("\nMARC: Going back to sleep.\n")
+
+                self.playback.speak("Going back to sleep.")
+
+                return
+
+            # ----------------------------------------
+            # Listen
+            # ----------------------------------------
+            self.logger.info("Listening for speech...")
+
+            audio_file = self.recorder.record()
+
+            if audio_file is None:
+                return
+
+            # ----------------------------------------
+            # Speech-to-Text
+            # ----------------------------------------
+            self.logger.info("Transcribing audio...")
+
+            user_text = self.stt.transcribe(audio_file)
+
+            if not user_text or not user_text.strip():
+                return
+
+            print(f"\nYou : {user_text}")
+
+            # Keep original text for the LLM
+            original_text = user_text.strip()
+
+            # Normalized version for wake words and commands
+            normalized = " ".join(
+                original_text.lower().split()
+            )
+
+            # ----------------------------------------
+            # Sleeping mode
+            # ----------------------------------------
+            if not self.conversation.is_active():
+
+                activated, cleaned_text = self.wakeword.detect(normalized)
+
+                if not activated:
+
+                    self.logger.info("Wake word not detected.")
+
+                    print("\nWaiting for wake word...\n")
+
+                    return
+
+                self.logger.info("Wake word detected.")
+
+                self.conversation.activate()
+
+                if cleaned_text == "":
+
+                    print("\nMARC: Yes?\n")
+
+                    self.playback.speak("Yes?")
+
+                    return
+
+                normalized = cleaned_text
+                original_text = cleaned_text
+
+                print(f"\nCommand : {cleaned_text}")
+
+            else:
+
+                self.logger.info("Conversation active")
+
+                self.conversation.refresh()
+
+            # ----------------------------------------
+            # Voice Commands
+            # ----------------------------------------
+            if normalized in self.EXIT_COMMANDS:
+
+                self.logger.info("Exit command received.")
+
+                self.playback.speak("Shutting down.")
+
+                raise KeyboardInterrupt
+
+            if normalized in self.SLEEP_COMMANDS:
+
+                self.logger.info("Sleep command received.")
+
+                self.conversation.deactivate()
+
+                self.playback.speak("Going back to sleep.")
+
+                return
+
+            # ----------------------------------------
+            # Assistant
+            # ----------------------------------------
+            self.logger.info("Generating response...")
+
+            response = self.assistant.chat(user_text)
+
+            if not response:
+              return
+
+            print(f"\nMARC: {response}")
+
+# Speak the response (blocking until speech is finished)
+            self.playback.speak(response)
+
+# NOW restart the conversation timeout
+            self.conversation.refresh()
+
+
+            print("\n----------------------------------------")
+
+        except KeyboardInterrupt:
+
+            self.logger.info("Interrupted by user.")
+
+            raise
+
+        except Exception as e:
+
+            self.logger.exception(f"Voice pipeline failed: {e}")
+================ backend/pipeline/assistant.py ==================
+📄 FILE SIZE:     3060 bytes
+
+from backend.core.logger import get_logger
+from backend.llm.factory import create_llm
+from backend.pipeline.intent_router import IntentRouter
+from backend.tools.calculator import calculate
+
+
+class Assistant:
+    """
+    Main Assistant Pipeline
+
+    Responsibilities:
+    - Receive user input
+    - Detect intent
+    - Call tools if needed
+    - Build prompts
+    - Talk to the LLM
+    - Maintain conversation memory
+    - Summarize long conversations
+    """
+
+    def __init__(self):
+        self.llm = create_llm()
+        self.router = IntentRouter()
+        self.logger = get_logger("Assistant")
+
+        self.history = []
+        self.summary = ""
+
+    def summarize_history(self) -> str:
+        """
+        Summarize older conversation history once it becomes large.
+        """
+
+        if len(self.history) < 12:
+            return self.summary
+
+        summary_input = "\n".join(
+            f"{role}: {message}"
+            for role, message in self.history[:-6]
+        )
+
+        prompt = f"""
+Summarize the following conversation.
+
+Keep only:
+- Important facts
+- User preferences
+- Important context
+
+Ignore greetings and small talk.
+
+Conversation:
+
+{summary_input}
+
+Summary:
+"""
+
+        try:
+            summary = self.llm.generate(prompt).strip()
+
+            if summary:
+                return summary
+
+            return self.summary
+
+        except Exception:
+            return self.summary
+
+    def build_prompt(self, user_input: str) -> str:
+        """
+        Build the prompt sent to the LLM.
+        """
+
+        new_summary = self.summarize_history()
+
+        if new_summary:
+            self.summary = new_summary
+
+        recent_context = "\n".join(
+            f"{role}: {message}"
+            for role, message in self.history[-6:]
+        )
+
+        system_prompt = """
+You are Jarvis.
+
+Identity Rules:
+- Your name is Jarvis.
+- Never invent another identity.
+- Never claim to be another person.
+- Never say your name is Holden, ChatGPT, Claude, Gemini, or any other assistant.
+- Stay in character.
+
+Communication Style:
+- Professional
+- Friendly
+- Concise
+- Helpful
+
+If the user calls you Jarvis,
+respond naturally as Jarvis.
+"""
+
+        return f"""
+{system_prompt}
+
+Conversation Summary:
+{self.summary}
+
+Recent Conversation:
+{recent_context}
+
+User: {user_input}
+Jarvis:
+"""
+
+    def chat(self, user_input: str) -> str:
+        """
+        Main conversation pipeline.
+        """
+
+        intent = self.router.classify(user_input)
+
+        self.logger.info(f"Intent: {intent}")
+        self.logger.info(f"User input: {user_input}")
+
+        if intent == "tool":
+            response = calculate(user_input)
+
+        else:
+            prompt = self.build_prompt(user_input)
+
+            try:
+                response = self.llm.generate(prompt)
+
+            except Exception as e:
+                self.logger.error(f"LLM Error: {e}")
+                response = "Sorry, I couldn't process that request."
+
+        self.history.append(("User", user_input))
+        self.history.append(("Jarvis", response))
+
+        return response
+================ backend/stt/whisper.py ==================
+📄 FILE SIZE:     2213 bytes
+
+from pathlib import Path
+import time
+
+from faster_whisper import WhisperModel
+
+from backend.core.logger import get_logger
+
+
+class WhisperSTT:
+    """
+    Speech-to-Text using Faster-Whisper.
+
+    Optimized for a real-time voice assistant.
+    """
+
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "auto",
+        compute_type: str = "int8",
+    ):
+        self.logger = get_logger("Whisper")
+
+        self.logger.info("Loading Faster-Whisper model...")
+
+        start = time.time()
+
+        self.model = WhisperModel(
+            model_size_or_path=model_size,
+            device=device,
+            compute_type=compute_type,
+        )
+
+        elapsed = time.time() - start
+
+        self.logger.info(
+            f"Whisper model loaded in {elapsed:.2f}s"
+        )
+
+    def transcribe(self, audio_path: str | Path) -> str:
+        """
+        Transcribe a WAV audio file.
+        """
+
+        audio_path = Path(audio_path)
+
+        if not audio_path.exists():
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_path}"
+            )
+
+        self.logger.info(
+            f"Transcribing {audio_path.name}"
+        )
+
+        start = time.time()
+
+        segments, info = self.model.transcribe(
+             str(audio_path),
+
+    # Fastest decoding
+      beam_size=1,
+     best_of=1,
+
+    # Fixed language
+     language="en",
+
+    # Not needed for a voice assistant
+    word_timestamps=False,
+
+    # Prevent previous context from affecting the result
+    condition_on_previous_text=False,
+        )
+
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
+
+        elapsed = time.time() - start
+
+        self.logger.info(
+            f"Language: {info.language}"
+        )
+
+        self.logger.info(
+            f"Transcription completed in {elapsed:.2f}s"
+        )
+
+        return text
+
+
+if __name__ == "__main__":
+
+    audio_file = (
+        Path(__file__).resolve().parent.parent.parent
+        / "recordings"
+        / "output.wav"
+    )
+
+    stt = WhisperSTT()
+
+    print("\nTranscribing...\n")
+
+    result = stt.transcribe(audio_file)
+
+    print("\nYou said:")
+    print(result)
+================ backend/audio/stream_recorder.py ==================
+📄 FILE SIZE:     4218 bytes
+
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+from backend.audio.vad import VoiceActivityDetector
+from backend.core.logger import get_logger
+
+
+class StreamRecorder:
+    """
+    Continuously listens to the microphone.
+
+    Starts recording when speech is detected.
+
+    Stops recording after prolonged silence.
+
+    Also provides lightweight speech detection
+    for future barge-in support.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        chunk_ms: int = 30,
+    ):
+
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.chunk_ms = chunk_ms
+
+        self.chunk_size = int(
+            sample_rate * chunk_ms / 1000
+        )
+
+        self.logger = get_logger("StreamRecorder")
+
+        self.vad = VoiceActivityDetector()
+
+        self.stream = None
+
+        self.output_dir = (
+            Path(__file__).resolve().parent.parent.parent
+            / "recordings"
+        )
+
+        self.output_dir.mkdir(exist_ok=True)
+
+    # --------------------------------------------------
+    # Stream Management
+    # --------------------------------------------------
+
+    def start_stream(self):
+        """
+        Open the microphone if not already open.
+        """
+
+        if self.stream is None:
+
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=self.chunk_size,
+            )
+
+            self.stream.start()
+
+            self.logger.info("Microphone opened")
+
+    def stop_stream(self):
+        """
+        Close microphone.
+        """
+
+        if self.stream is not None:
+
+            self.stream.stop()
+            self.stream.close()
+
+            self.stream = None
+
+            self.logger.info("Microphone closed")
+
+    # --------------------------------------------------
+    # Recording
+    # --------------------------------------------------
+
+    def generate_filename(self) -> Path:
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        return self.output_dir / f"{timestamp}.wav"
+
+    def record(self) -> Path | None:
+
+        self.logger.info("Listening...")
+
+        self.start_stream()
+
+        buffer = []
+
+        try:
+
+            while True:
+
+                chunk, _ = self.stream.read(
+                    self.chunk_size
+                )
+
+                chunk = chunk.flatten()
+
+                state = self.vad.update(chunk)
+
+                if state == "idle":
+                    continue
+
+                if state == "start":
+
+                    self.logger.info(
+                        "Recording started"
+                    )
+
+                    buffer = [chunk]
+
+                    continue
+
+                if state == "recording":
+
+                    buffer.append(chunk)
+
+                    continue
+
+                if state == "stop":
+
+                    self.logger.info(
+                        "Recording stopped"
+                    )
+
+                    audio = np.concatenate(buffer)
+
+                    filename = self.generate_filename()
+
+                    sf.write(
+                        filename,
+                        audio,
+                        self.sample_rate,
+                    )
+
+                    self.logger.info(
+                        f"Saved {filename.name}"
+                    )
+
+                    return filename
+
+        finally:
+
+            self.stop_stream()
+
+    # --------------------------------------------------
+    # Speech Detection
+    # --------------------------------------------------
+
+    def detect_speech(self) -> bool:
+        """
+        Returns True if speech is detected.
+
+        Used for future interruptible TTS.
+        """
+
+        self.start_stream()
+
+        chunk, _ = self.stream.read(
+            self.chunk_size
+        )
+
+        chunk = chunk.flatten()
+
+        return self.vad.is_speech(chunk)
+
+
+if __name__ == "__main__":
+
+    recorder = StreamRecorder()
+
+    print()
+    print("Speak...")
+
+    file = recorder.record()
+
+    print()
+    print(file)
+================ backend/state/conversation.py ==================
+📄 FILE SIZE:     2285 bytes
+
+import time
+
+try:
+    from backend.core.logger import get_logger
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[2]
+    sys.path.append(str(project_root))
+
+    from backend.core.logger import get_logger
+
+
+class ConversationManager:
+    """
+    Manages:
+    - Active / Sleep state
+    - Timeout handling
+    - Voice commands (sleep/exit)
+    """
+
+    def __init__(self, timeout: int = 60):
+        self.logger = get_logger("ConversationManager")
+
+        self._active = False
+        self.timeout = timeout
+        self.last_interaction = None
+
+    # -------------------------
+    # State control
+    # -------------------------
+
+    def activate(self):
+        self._active = True
+        self.refresh()
+        self.logger.info("Conversation activated.")
+
+    def deactivate(self):
+        if self._active:
+            self.logger.info("Conversation ended.")
+
+        self._active = False
+        self.last_interaction = None
+
+    def is_active(self) -> bool:
+        return self._active
+
+    # -------------------------
+    # Timeout logic
+    # -------------------------
+
+    def refresh(self):
+        self.last_interaction = time.time()
+
+    def has_timed_out(self) -> bool:
+        if not self._active or self.last_interaction is None:
+            return False
+
+        return (time.time() - self.last_interaction) > self.timeout
+
+    # -------------------------
+    # NEW: Voice command handler
+    # -------------------------
+
+    EXIT_COMMANDS = {
+        "exit",
+        "quit",
+        "shutdown",
+        "goodbye",
+        "stop",
+        "stop listening",
+    }
+
+    SLEEP_COMMANDS = {
+        "sleep",
+        "go to sleep",
+        "go sleep",
+        "rest",
+    }
+
+    def handle_commands(self, text: str):
+        """
+        Returns:
+        - "exit" → shutdown program
+        - "sleep" → go inactive
+        - None → normal flow
+        """
+
+        if not text:
+            return None
+
+        t = text.lower().strip()
+
+        if t in self.EXIT_COMMANDS:
+            self.logger.info("Exit command detected.")
+            return "exit"
+
+        if t in self.SLEEP_COMMANDS:
+            self.logger.info("Sleep command detected.")
+            return "sleep"
+
+        return None
+================ backend/tts/piper_tts.py ==================
+❌ FILE NOT FOUND
+
+================ BACKUP COMPLETE ================
